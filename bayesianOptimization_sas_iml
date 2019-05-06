@@ -397,6 +397,32 @@
 %mend plotAll;
 
 
+%macro plotGif(datalib=work, startIter=1, endIter=10);
+   /*******************************************************************************
+    Create an animation gif file to show the step-by-step optimization.
+   *******************************************************************************/ 
+   %do i=&startIter %to &endIter;   
+      * get the proposed point;
+      data _null_;
+         set &datalib..allProposed;
+         where iteration = &i;
+         call symputx('X_next', X_train);
+      run;
+   
+      proc sgplot data=&datalib..iterationHistory cycleattrs;
+         title "Iteration &i";
+         series x=x y=y / name="obj" legendlabel="Target" lineattrs=(thickness=2);
+         scatter x=x y=Y_train / markerattrs=(symbol=CircleFilled) legendlabel="Observations";
+         series x=x y=mu / name="mu" legendlabel="Prediction" lineattrs=(thickness=2);
+         band x=x upper=ucl lower=lcl / transparency=.5 legendlabel="95% confidence interval";
+         refline &X_next / axis=x label="&X_next";
+         yaxis label='Y' min=-5 max=5;
+         xaxis label='X';
+         where iteration = &i;
+      run; 
+   %end;
+%mend plotGif;
+
 
 /***************************************************************************************
   Demonstration of Bayesian Optimization with a 1-dimensional data.
@@ -549,6 +575,23 @@ quit;
 ods html file="bayesianOptimization.html"; 
 %plotAll(startIter=1, endIter=10);
 ods html close;
+
+
+
+ods html;
+ods graphics / imagefmt=gif width=8in height=6in;     /* each image is 4in x 3in GIF */
+options papersize=('8 in', '6 in')                    /* set size for images */
+        nodate nonumber                               /* do not show date, time, or frame number */
+        animduration=0.5 animloop=yes noanimoverlay   /* animation details */
+        printerpath=gif animation=start;              /* start recording images to GIF */
+ods printer file='C:\AnimGif\BayesianOptimization.gif';  /* images saved into animated GIF */
+ods html select none;                                 /* suppress screen output */
+
+%plotGif(startIter=1, endIter=10);
+
+ods html select all;                                  /* restore screen output */
+options printerpath=gif animation=stop;               /* stop recording images */
+ods printer close;      
 
 
 
