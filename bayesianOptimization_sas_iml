@@ -1,0 +1,603 @@
+/***************************************************************************************
+  This program implements Bayesian Optimization leveraging Gaussian Process Regression.
+***************************************************************************************/ 
+
+%macro jitChol;
+   start isSingular(A);
+      /*******************************************************************************
+       Check if a matrix is singular.
+       
+       Args: 
+          A: a matrix. 
+          
+       Returns: 
+          1 for singular; 0 for non-singular. 
+      *******************************************************************************/ 
+      U = root(A, "NoError");
+      if all(U=.) then return(1);
+      else do;
+         eigen = eigval(A);     
+         if (abs(min(eigen))<=1e-8) then 
+            return(1);
+         else
+            return(0);
+      end;  
+   finish;
+   
+   
+   start jitChol(A, maxtries=10);
+      /*******************************************************************************
+       Computes the Jitter Cholesky decomposition of a matrix.
+       
+       Args: 
+          A: a matrix
+          maxtries: max tries for jitter Cholesky decomposition    
+          
+       Returns: 
+          Upper triangular matrix. 
+      *******************************************************************************/ 
+      isSingular = isSingular(A);
+      if isSingular = 1 then do;
+         jitter = abs(mean(vecdiag(A)))*1e-6;
+         num_tries = 1;
+         do while (num_tries <= maxtries);
+            isSingular = isSingular(A + I(nrow(A))*jitter);
+            if isSingular = 1 then do;
+               jitter = jitter*10;
+            end;
+            else do;
+               U = root(A + I(nrow(A))*jitter, "NoError");
+               return(U);
+            end;
+            num_tries = num_tries + 1;
+         end;
+      end;    
+      else do;
+         U = root(A, "NoError");
+         return(U);
+      end;   
+   finish;
+
+
+   start jitInv(A, maxtries=10);
+      /*******************************************************************************
+       Computes the inverse of a matrix based on its Jitter Cholesky decomposition.
+       
+       Args: 
+          A: a matrix
+          maxtries: max tries for jitter Cholesky decomposition   
+          
+       Returns: 
+          Inverse of a matrix if it is invertible after max tries of Jitter Cholesky
+          decomposition; otherwise a matrix with all missing values will be returned.
+      *******************************************************************************/ 
+      U = jitChol(A, maxtries);
+      if all(U=.) then 
+         invA = .;
+      else do;
+         invU = inv(U);
+         invA = invU*t(invU);
+      end;  
+      return(invA);
+   finish;
+%mend jitChol;
+
+
+%macro gpRegression;
+   %jitChol;
+   
+   start pairwiseDist2(x, xs); 
+      /*******************************************************************************
+       Computes the squared pairwise distance between rows of x and xs. SAS IML has a
+       distance function, but this function supports matrix only. If x or xs is a
+       scalar, it does not work.
+       
+       Args: 
+          X: a matrix or scalar (n x d). 
+          XS: a matrix or scalar (m x d). 
+          
+       Returns: 
+          A (n x m) matrix. 
+      *******************************************************************************/ 
+      dist = J(nrow(x), nrow(xs), 0);    
+      do i=1 to nrow(x);
+         do j=1 to nrow(xs);
+            d=x[i,]-xs[j,];
+            d2 = d##2;
+            dist[i,j]=d2[,+];
+         end;   
+      end;  
+      return(dist);    
+   finish;    
+   
+   
+   start kernel(x, xs, sigma_f=1.0, length_scale=1.0);  
+      /*******************************************************************************
+       Matern 5/2 kernel function.
+       
+       Args: 
+          X: a matrix or row vector (n x d). 
+          XS: a matrix or row vector (m x d). 
+          sigma_f: Kernel vertical variation parameter. 
+          length_scale: Kernel length parameter. 
+          
+       Returns: 
+          A (n x m) matrix. 
+      *******************************************************************************/ 
+      r2 = pairwiseDist2(x, xs);
+      sumR2 = r2#length_scale;
+      sqrtSumR2 = sqrt(sumR2);
+      k = sigma_f**2#(1+sqrt(5)#sqrtSumR2+5/3#(sumR2))#exp(-sqrt(5)#sqrtSumR2);
+      return(k);
+   finish;   
+   
+
+   start logLik(inits) global(X_train, Y_train);
+      /*******************************************************************************
+       Calculate the marginal likelihood.
+       Formulation 2.30 in chapter 2 of book Gaussian Process for Machine Learning
+       
+       Args: 
+          inits: initial values of Kernel parameters. 
+          X_train: inputs of train data. 
+          Y_train: target of train data. 
+          
+       Returns: 
+          The negative value of marginal likelihood. 
+      *******************************************************************************/ 
+      sigma_f=inits[1];
+      length_scale=inits[2];
+      sigma_y=inits[3];      
+      Kxx = kernel(X_train, X_train, sigma_f, length_scale);
+      noisyKxx = Kxx+sigma_y**2*i(nrow(Kxx));
+      invNosiyKxx = jitInv(noisyKxx, 10);
+      Lm = jitchol(noisyKxx, 10);
+      logdetKxx = 2*sum(log(vecdiag(Lm))); 
+      pi = constant('pi');
+      log_lik = -1/2*t(Y_train)*invNosiyKxx*Y_train-1/2*logdetKxx-nrow(x)/2*log(2*pi);
+      neg_log_lik = -log_lik;
+      return(neg_log_lik);
+   finish;
+   
+   
+   start gprFit(inits) global(X_train, Y_train);
+      /*******************************************************************************
+       Fit a Gaussian Process Regression model through optimizing 
+       theta(sigma_f, length_scale, sigma_y) to maximize the marginal likelihood.
+       Here we will optimize theta to minimize the negative value of marginal likelihood.
+       
+       Args: 
+          inits: initial values of Kernel parameters. 
+          X_train: inputs of train data. 
+          Y_train: target of train data. 
+          
+       Returns: 
+          The best theta at which the negative log likelihood reaches the minimum value. 
+      *******************************************************************************/ 
+      opt = j(1,11,.); 
+      opt[1]=0;  /* find minimum of function   */
+      opt[2]=0;  /* noprint output      */
+      bounds = {0 1e-15 0, . . .}; 
+      /* The quasi-Newton method is used to compute the optimum values  */
+      call nlpqn(rc, fit_par, "logLik", inits, opt, bounds); 
+      return(fit_par);
+   finish;
+   
+   
+   start gprPredict(X_s, X_train, Y_train, gprParms);
+      /*******************************************************************************
+       Computes the suffifient statistics of the GP posterior predictive distribution
+       from m training data X_train and Y_train and n new inputs X_s. 
+       
+       Args: 
+          X_s: New input locations (n x d). 
+          X_train: Training locations (m x d). 
+          Y_train: Training targets (m x 1). 
+          gprParms: Model parameters. 
+          
+       Returns: 
+          A list including two items: mu_s and cov_s;
+          mu_s: posterior mean matrix (n x d)
+          cov_s:covariance matrix (n x n). 
+      *******************************************************************************/ 
+      sigma_f = gprParms[1];
+      l = gprParms[2];
+      sigma_y = gprParms[3];
+      
+      K = kernel(X_train, X_train, l, sigma_f) + sigma_y**2 * I(nrow(X_train));
+      K_s = kernel(X_train, X_s, l, sigma_f);
+      K_ss = kernel(X_s, X_s, l, sigma_f) + 1e-8 * I(nrow(X_s));
+      K_inv = jitInv(K, 10);
+    
+      * Equation (4);
+      mu_s = T(K_s)*K_inv*Y_train;
+
+      * Equation (5);
+      cov_s = K_ss - T(K_s)*K_inv*K_s;
+      std_s = sqrt(abs(vecdiag(cov_s)));
+   
+      resultList = ListCreate();
+      call ListAddItem(resultList, mu_s);
+      call ListSetName(resultList, 1, 'mu_s');
+      call ListAddItem(resultList, std_s);
+      call ListSetName(resultList, 2, 'std_s');
+      
+      return(resultList);
+   finish;
+%mend gpRegression;
+
+
+%macro bayesianOptimization;
+   start acquisition(X, X_train, Y_train, gprParms, xi=0.01);
+      /*******************************************************************************
+       Computes the EI at points X based on existing samples X_train
+       and Y_train using a Gaussian process surrogate model.
+    
+       Args:
+          X: Points at which EI shall be computed (m x d).
+          xi: Exploitation-exploration trade-off parameter.
+          X_train: Sample locations (n x d).
+          Y_train: Sample values (n x 1).
+          gprParms: GP regression model parameters.
+    
+       Returns:
+          Expected improvements at points X.   
+      *******************************************************************************/   
+      predictResults = gprPredict(X, X_train, Y_train, gprParms);
+      mu = predictResults$"mu_s";
+      sigma = predictResults$"std_s";
+      
+      predictResults = gprPredict(X_train, X_train, Y_train, gprParms);
+      mu_sample = predictResults$"mu_s";
+    
+      * Needed for noise-based model;
+      * otherwise use np.max(Y_train);
+      * See also section 2.4 in [...];
+      mu_sample_opt = max(mu_sample);
+
+      ei = J(nrow(X), 1, 0);
+      idx = loc(sigma > 0);
+      imp = mu - mu_sample_opt - xi;
+      Z = J(nrow(X), 1, 0);
+      Z[idx] = imp[idx]/sigma[idx];
+      ei[idx] = imp[idx] # cdf("Normal", Z[idx]) + sigma[idx] # pdf("Normal", Z[idx]);
+
+      return(ei);
+   finish;
+   
+
+   start proposeLocation(X, X_train, Y_train, gprParms);
+      /*******************************************************************************
+       Proposes the next sampling point by optimizing the acquisition function.
+    
+       Args:
+          X: Points at which EI shall be computed (m x d).
+          X_train: Sample locations (n x d).
+          Y_train: Sample values (n x 1).
+          gprParms: GP regression model parameters.
+
+       Returns:
+          Location of the acquisition function reaches maximum.
+      *******************************************************************************/  
+      
+      ei = acquisition(X, X_train, Y_train, gprParms);
+      idx = loc(ei = max(ei));
+      max_val = ei[idx];
+      if max_val > 0 then do;
+         max_x = X[idx,];
+      end;
+      else do;
+         max_x = J(1, ncol(X), .);
+      end;
+      acquisitionMatrix = X||ei;
+      create acquisitionResults from acquisitionMatrix; 
+      append from acquisitionMatrix; 
+      close acquisitionResults;
+   
+      resultList = ListCreate();
+      call ListAddItem(resultList, max_x);
+      call ListSetName(resultList, 1, 'max_x');
+      call ListAddItem(resultList, max_val);
+      call ListSetName(resultList, 2, 'max_val');
+         
+      return (resultList);
+   finish proposeLocation; 
+%mend bayesianOptimization;
+
+
+%macro plotAll(startIter=1, endIter=10);
+   /*******************************************************************************
+    Create step-by-step optimization plots.
+   *******************************************************************************/ 
+   
+   * set size of graphics ;
+   ods graphics / width=8cm height=6cm;
+
+   proc sgplot data=iterationHistory cycleattrs;
+      title "Target function";
+      series x=x y=y / name="obj" legendlabel="Target" lineattrs=(thickness=2);
+      scatter x=x y=Y_train / markerattrs=(symbol=CircleFilled) legendlabel="Initial samples";
+      yaxis label='f(X)';
+      where iteration = 0;
+   run;  
+
+   * start gridded layout with two columns ;
+   ods layout gridded columns=2;
+
+   %do i=&startIter %to &endIter;   
+      * get the proposed point;
+      data _null_;
+         set allProposed;
+         where iteration = &i;
+         call symputx('X_next', X_train);
+      run;
+   
+      * generate output for first region ;
+      ods region;
+      proc sgplot data=iterationHistory cycleattrs;
+         title "Iteration &i";
+         series x=x y=y / name="obj" legendlabel="Target" lineattrs=(thickness=2);
+         scatter x=x y=Y_train / markerattrs=(symbol=CircleFilled) legendlabel="Observations";
+         series x=x y=mu / name="mu" legendlabel="Prediction" lineattrs=(thickness=2);
+         band x=x upper=ucl lower=lcl / transparency=.5 legendlabel="95% confidence interval";
+         refline &X_next / axis=x label="&X_next";
+         yaxis label='Y';
+         xaxis label='X';
+         where iteration = &i;
+      run; 
+
+      * generate output for second region;
+      ods region;
+      proc sgplot data=iterationHistory cycleattrs;
+         title "Acquisition plot and next best guess";
+         series x=x y=Acquisition / lineattrs=(thickness=2);
+         refline &X_next / axis=x label="&X_next";
+         xaxis label='X';
+         yaxis label='Acquisition';
+         where iteration = &i;
+      run;  
+   %end;
+   
+   proc sort data=allProposed; 
+      by Iteration; 
+   run;
+
+   data plotData;
+      set allProposed;
+      by Iteration;
+      distance = abs(X_train - lag(X_train));
+   run;   
+
+   * generate output for first region ;
+   ods region;
+   proc sgplot data=plotData cycleattrs noautolegend;
+      title "Distance between consecutive x's";
+      series x=iteration y=distance / 
+         lineattrs=(thickness=2) 
+         markers 
+         markerattrs=(symbol=CircleFilled);
+      xaxis label='Iteration' values=(2 to &endIter by 1);
+      yaxis label='Distance';
+      where iteration ge 2;
+   run;   
+
+   * generate output for second region;
+   ods region;
+   proc sgplot data=plotData cycleattrs noautolegend;
+      title "Value of best selected sample";
+      series x=iteration y=Y_Best / 
+         lineattrs=(thickness=2) 
+         markers 
+         markerattrs=(symbol=CircleFilled);
+      xaxis label='Iteration'  values=(1 to &endIter by 1);
+      yaxis label='Y_Best';
+   run;
+
+   ods layout end;
+%mend plotAll;
+
+
+
+/***************************************************************************************
+  Demonstration of Bayesian Optimization with a 1-dimensional data.
+***************************************************************************************/ 
+proc iml;
+   %gpRegression;
+   %bayesianOptimization;  
+
+   * Target function;
+   start f(X, noise=0);
+       return (-sin(3*X) - X##2 + 0.7*X + noise * randfun(nrow(X), "Normal"));
+   finish;   
+
+   * Search space of sampling points;
+   X = T(do(-1, 1.99, 0.01));
+   call randseed(123);
+   Y = f(X, 0);   
+
+   * Initialize samples;
+   X_train ={-0.9, 1.1};
+   noise = 0.2;
+   Y_train = f(X_train, noise);  
+   
+   * Initial parameters of GP regression model;
+   gprParms = {1 1 0};
+   
+   * Max iterations for sequential Bayesian Optimization;
+   n_iter = 15;
+   do i=1 to n_iter;
+      * Update Gaussian process with existing samples;
+      gprParms = gprFit(gprParms);
+   
+      * Obtain next sampling point from the acquisition function (acquisition);
+      proposeResults = proposeLocation(X, X_train, Y_train, gprParms);
+      X_next = proposeResults$"max_x";
+      if X_next=. then leave;
+    
+      * Obtain next noisy sample from the objective function;
+      Y_next = f(X_next, noise);
+    
+      * Add sample to previous samples;
+      X_train = X_train//X_next;
+      Y_train = Y_train//Y_next;  
+      
+      * Save all proposed sampling points into a matrix;
+      allProposed = allProposed//(j(1, 1, i)||X_next);
+   end;
+   
+   * Save all proposed sampling points into a SAS dataset;
+   create allProposed from allProposed [colname={"Iteration" "X"}];
+   append from allProposed;
+   close allProposed;
+run;
+quit;
+
+
+
+/***************************************************************************************
+  Step-by-Step demonstration of Bayesian Optimization with a 1-dimensional data.
+***************************************************************************************/
+proc iml;
+   %gpRegression;
+   %bayesianOptimization;  
+
+   * Target function;
+   start f(X, noise=0);
+       return (-sin(3*X) - X##2 + 0.7*X + noise * randfun(nrow(X), "Normal"));
+   finish;   
+
+   * Search space of sampling points;
+   X = T(do(-1, 1.99, 0.01));
+   call randseed(123);
+   Y = f(X, 0);   
+
+   * Initialize samples;
+   X_train ={-0.9, 1.1};
+   noise = 0.2;
+   Y_train = f(X_train, noise);  
+   
+   * Save data for visualization purpose;
+   create targetFunction var {X Y};  append;  close;
+   create initSamples var {X_train Y_train};  append;  close;
+   submit;
+      data iterationHistory; 
+         iteration = 0;      
+         set targetFunction initSamples(rename=(X_train=X)); 
+         length mu 8;
+         length ucl 8;
+         length lcl 8;
+         length Acquisition 8;
+      run;
+   endsubmit;
+   
+   * Initial parameters of GP regression model;
+   gprParms = {1 1 0};
+   
+   * Max iterations for sequential Bayesian Optimization;
+   n_iter = 15;
+   do i=1 to n_iter;
+      * Update Gaussian process with existing samples;
+      gprParms = gprFit(gprParms);
+   
+      * Obtain next sampling point from the acquisition function (acquisition);
+      proposeResults = proposeLocation(X, X_train, Y_train, gprParms);
+      X_next = proposeResults$"max_x";
+      if X_next=. then leave;
+    
+      * Obtain next noisy sample from the objective function;
+      Y_next = f(X_next, noise);
+  
+      * Save data for visualization purpose;
+      predictResults = gprPredict(X, X_train, Y_train, gprParms);
+      mu = predictResults$"mu_s";
+      sigma = predictResults$"std_s";
+      interval = 2*sigma;
+      lcl = mu - interval;
+      ucl = mu + interval;
+      create samples var {X_train Y_train};  append;  close;
+      create predictions var {X mu lcl ucl};  append;  close;
+      submit i X_next;
+         data thisIteration;  
+            iteration = &i;
+            set targetFunction 
+                samples(rename=(X_train=X)) 
+                predictions
+                acquisitionResults(rename=(col1=X col2=Acquisition));  
+         run;
+         
+         proc append base=iterationHistory data=thisIteration force nowarn;run;
+      endsubmit;  
+    
+      * Add sample to previous samples;
+      X_train = X_train//X_next;
+      Y_train = Y_train//Y_next;  
+      
+      Y_Best = f(X_next, 0);
+      
+      * Save all proposed sampling points into a matrix;
+      allProposed = allProposed//(j(1, 1, i)||X_next||Y_Best);
+   end;
+   
+   * Save all proposed sampling points into a SAS dataset;
+   create allProposed from allProposed [colname={"Iteration" "X_train" "Y_Best"}];
+   append from allProposed;
+   close allProposed;
+run;
+quit;
+
+
+ods html file="bayesianOptimization.html"; 
+%plotAll(startIter=1, endIter=10);
+ods html close;
+
+
+
+/***************************************************************************************
+  Demonstrate Bayesian Optimization with a 2-dimensional data.
+***************************************************************************************/ 
+proc iml;
+   %gpRegression;
+   %bayesianOptimization; 
+
+   start f(X, noise=0);
+      return (sin(X[,1])#sin(X[,2]) + noise * randfun(nrow(X), "Normal"));
+   finish;   
+
+   Mean = {1 2};
+   Cov = {2.4 3, 3 8.1};
+   call randseed(123);
+   X = RandNormal(300, Mean, Cov );
+   Y = f(X, 0);   
+
+   * Initialize samples;
+   obsIdx = sample(1:nrow(X), 2);  
+   X_train = X[obsidx, ];
+   noise = 0.2;
+   Y_train = f(X_train, noise);   
+   
+   gprParms = {1 1 1};
+   n_iter = 20;
+   do i=1 to n_iter;
+      * Update Gaussian process with existing samples;
+      gprParms = gprFit(gprParms);
+      
+      * Obtain next sampling point from the acquisition function (acquisition);
+      proposeResults = proposeLocation(X, X_train, Y_train, gprParms);
+      X_next = proposeResults$"max_x";
+      if X_next=. then leave;
+    
+      * Obtain next noisy sample from the objective function;
+      Y_next = f(X_next, noise);
+    
+      * Add sample to previous samples;
+      X_train = X_train//X_next;
+      Y_train = Y_train//Y_next;   
+      
+      allProposed = allProposed//(j(1, 1, i)||X_next);
+   end;
+   
+   create allProposed from allProposed;
+   append from allProposed;
+   close allProposed;
+run;
+quit;
