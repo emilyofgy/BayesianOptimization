@@ -20,10 +20,11 @@
 %macro latinHyperCubeSamp;
 start latinHyperCubeSamp(seed=0, sampleSize, designTable, resultTable); 
    /* read design table */ 
-   use designTable; 
+   dsName = designTable;
+   use (dsName); 
    read all var {minValue maxValue} into designTable; 
    read all var {parameterName} into varNames; 
-   close designTable;  
+   close (dsName);  
    varNames = T(varNames);
    
 
@@ -65,7 +66,7 @@ finish;
 /* Ex.1: Sampling from 2-dimensional space */
 /*******************************************/
 
-data designTable;
+data designTable1;
    input parameterName :$32. minValue maxValue ;
    cards;
 x1 0 1
@@ -76,7 +77,7 @@ run;
 
 proc iml; 
    %latinHyperCubeSamp;
-   run latinHyperCubeSamp(0, 20, designTable, "lhsExampleResult1"); 
+   run latinHyperCubeSamp(0, 20, "designTable1", "lhsExampleResult1"); 
 run;
 quit;
  
@@ -95,7 +96,7 @@ quit;
 /*******************************************/
 /* Ex.2: Sampling from 5-dimensional space */
 /*******************************************/
-data designTable;
+data designTable2;
    input parameterName :$32. minValue maxValue ;
    cards;
 parm1 0 1
@@ -109,11 +110,12 @@ run;
 
 proc iml; 
    %latinHyperCubeSamp;
-   run latinHyperCubeSamp(0, 10, designTable, "lhsExampleResult2"); 
+   run latinHyperCubeSamp(0, 10, "designTable2", "lhsExampleResult2"); 
 run;
 quit;
 
 
 title "Latin Hypercube Example 2";
 proc print data=lhsExampleResult2;
-run;quit;  
+run;quit;
+   
