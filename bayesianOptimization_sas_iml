@@ -1,5 +1,12 @@
 /***************************************************************************************
   This program implements Bayesian Optimization leveraging Gaussian Process Regression.
+  NOTE: This program requires SAS/IML 15.1.
+  
+        predictResults$"mu_s" is a new syntax introduced since SAS/IML 14.3 (SAS 9.4M5). 
+        Pls use mu = ListGetItem(predictResults, "mu_s"); with old versions.
+        
+        leave statement is a new syntax introduced since SAS/IML 15.1 (SAS 9.4M6).
+        Pls use do until with old versions.
 ***************************************************************************************/ 
 
 %macro jitChol;
@@ -86,31 +93,6 @@
 %macro gpRegression;
    %jitChol;
    
-   start pairwiseDist2(x, xs); 
-      /*******************************************************************************
-       Computes the squared pairwise distance between rows of x and xs. SAS IML has a
-       distance function, but this function supports matrix only. If x or xs is a
-       scalar, it does not work.
-       
-       Args: 
-          X: a matrix or scalar (n x d). 
-          XS: a matrix or scalar (m x d). 
-          
-       Returns: 
-          A (n x m) matrix. 
-      *******************************************************************************/ 
-      dist = J(nrow(x), nrow(xs), 0);    
-      do i=1 to nrow(x);
-         do j=1 to nrow(xs);
-            d=x[i,]-xs[j,];
-            d2 = d##2;
-            dist[i,j]=d2[,+];
-         end;   
-      end;  
-      return(dist);    
-   finish;    
-   
-   
    start kernel(x, xs, sigma_f=1.0, length_scale=1.0);  
       /*******************************************************************************
        Matern 5/2 kernel function.
@@ -124,8 +106,8 @@
        Returns: 
           A (n x m) matrix. 
       *******************************************************************************/ 
-      r2 = pairwiseDist2(x, xs);
-      sumR2 = r2#length_scale;
+      r = distance(x, xs, "L2");
+      sumR2 = (r##2)#length_scale;
       sqrtSumR2 = sqrt(sumR2);
       k = sigma_f**2#(1+sqrt(5)#sqrtSumR2+5/3#(sumR2))#exp(-sqrt(5)#sqrtSumR2);
       return(k);
@@ -151,8 +133,8 @@
       Kxx = kernel(X_train, X_train, sigma_f, length_scale);
       noisyKxx = Kxx+sigma_y**2*i(nrow(Kxx));
       invNosiyKxx = jitInv(noisyKxx, 10);
-      Lm = jitchol(noisyKxx, 10);
-      logdetKxx = 2*sum(log(vecdiag(Lm))); 
+      logabsdetKxx = logabsdet(noisyKxx); 
+      logdetKxx = logabsdetKxx[1]; 
       pi = constant('pi');
       log_lik = -1/2*t(Y_train)*invNosiyKxx*Y_train-1/2*logdetKxx-nrow(x)/2*log(2*pi);
       neg_log_lik = -log_lik;
@@ -424,6 +406,7 @@
 %mend plotGif;
 
 
+
 /***************************************************************************************
   Demonstration of Bayesian Optimization with a 1-dimensional data.
 ***************************************************************************************/ 
@@ -577,7 +560,6 @@ ods html file="bayesianOptimization.html";
 ods html close;
 
 
-
 ods html;
 ods graphics / imagefmt=gif width=8in height=6in;     /* each image is 4in x 3in GIF */
 options papersize=('8 in', '6 in')                    /* set size for images */
@@ -592,6 +574,7 @@ ods html select none;                                 /* suppress screen output 
 ods html select all;                                  /* restore screen output */
 options printerpath=gif animation=stop;               /* stop recording images */
 ods printer close;      
+
 
 
 
